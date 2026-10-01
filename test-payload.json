@@ -1,0 +1,11 @@
+{
+  "threadId": "thread-test-1",
+  "runId": "run-test-1",
+  "messages": [
+    {
+      "id": "user-1",
+      "role": "user",
+      "content": "Hello FlowOne"
+    }
+  ]
+}

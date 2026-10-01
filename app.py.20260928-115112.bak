@@ -1,0 +1,1037 @@
+import asyncio
+import json
+import os
+import uuid
+from typing import Any
+
+import httpx
+
+from dotenv import load_dotenv
+
+from fastapi import (
+    FastAPI,
+    Request,
+)
+
+from fastapi.middleware.cors import (
+    CORSMiddleware,
+)
+
+from fastapi.responses import (
+    StreamingResponse,
+)
+
+
+# =========================================================
+# ENVIRONMENT
+# =========================================================
+
+load_dotenv()
+
+OPENROUTER_API_KEY = os.getenv(
+    "OPENROUTER_API_KEY",
+    "",
+)
+
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "openai/gpt-4o-mini",
+)
+
+OPENROUTER_URL = (
+    "https://openrouter.ai/api/v1/chat/completions"
+)
+
+
+# =========================================================
+# APP
+# =========================================================
+
+app = FastAPI(
+    title="FlowOne Copilot Runtime",
+    version="0.4.0",
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================================================
+# HEALTH
+# =========================================================
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "flowone-copilot-runtime",
+        "mode": "local-poc",
+        "model": OPENROUTER_MODEL,
+        "openrouterConfigured": bool(
+            OPENROUTER_API_KEY
+        ),
+    }
+
+
+# =========================================================
+# AG-UI HELPERS
+# =========================================================
+
+def encode_sse(
+    event: dict[str, Any],
+) -> str:
+    return (
+        f"data: {json.dumps(event)}\n\n"
+    )
+
+
+def extract_text(
+    content: Any,
+) -> str:
+    if isinstance(
+        content,
+        str,
+    ):
+        return content
+
+    if isinstance(
+        content,
+        list,
+    ):
+        parts: list[str] = []
+
+        for item in content:
+            if isinstance(
+                item,
+                str,
+            ):
+                parts.append(
+                    item
+                )
+
+            elif isinstance(
+                item,
+                dict,
+            ):
+                text = item.get(
+                    "text"
+                )
+
+                if isinstance(
+                    text,
+                    str,
+                ):
+                    parts.append(
+                        text
+                    )
+
+        return " ".join(
+            parts
+        )
+
+    return ""
+
+
+def get_last_user_message(
+    payload: dict[str, Any],
+) -> str:
+    messages = (
+        payload.get(
+            "messages"
+        )
+        or []
+    )
+
+    for message in reversed(
+        messages
+    ):
+        if not isinstance(
+            message,
+            dict,
+        ):
+            continue
+
+        if (
+            message.get(
+                "role"
+            )
+            != "user"
+        ):
+            continue
+
+        return extract_text(
+            message.get(
+                "content"
+            )
+        )
+
+    return ""
+
+
+# =========================================================
+# FLOWONE CONTEXT
+# =========================================================
+
+def build_flowone_context(
+    state: dict[str, Any],
+) -> str:
+    if not state:
+        return (
+            "No FlowOne application context "
+            "was supplied."
+        )
+
+    return json.dumps(
+        state,
+        indent=2,
+        default=str,
+    )
+
+
+# =========================================================
+# INTENT CLASSIFICATION
+# =========================================================
+
+async def classify_intent(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    First controlled intent layer.
+
+    Current supported intents:
+
+    ANSWER
+        Normal grounded conversational response.
+
+    SHOW
+        Ask FlowOne frontend to render structured data.
+
+    Only one SHOW resource is implemented in this step:
+        overdue_customers
+    """
+
+    user_message = (
+        get_last_user_message(
+            payload
+        )
+    )
+
+    if not user_message:
+        return {
+            "intent":
+                "ANSWER",
+
+            "resource":
+                None,
+        }
+
+    system_prompt = """
+You are the intent router for FlowOne Copilot.
+
+Return ONLY a JSON object.
+
+Current allowed intents:
+
+1. ANSWER
+Use when the user wants:
+- an explanation
+- a factual answer
+- a summary
+- business context
+- "who am I"
+- "what needs my attention"
+- "what is my DSO"
+- questions that can be answered from current context
+
+2. SHOW
+Use when the user explicitly wants structured business data
+displayed in the application.
+
+The ONLY currently supported SHOW resource is:
+
+overdue_customers
+
+Use:
+{
+  "intent": "SHOW",
+  "resource": "overdue_customers"
+}
+
+for requests such as:
+
+- show me overdue customers
+- show overdue customers
+- display overdue customers
+- list the overdue customers
+- show top overdue customers
+- show customers with the highest DSO
+- show high DSO customers
+
+For everything else return:
+
+{
+  "intent": "ANSWER",
+  "resource": null
+}
+
+Do not invent another resource.
+Do not include markdown.
+Do not include explanation.
+""".strip()
+
+    body = {
+        "model":
+            OPENROUTER_MODEL,
+
+        "messages": [
+            {
+                "role":
+                    "system",
+
+                "content":
+                    system_prompt,
+            },
+            {
+                "role":
+                    "user",
+
+                "content":
+                    user_message,
+            },
+        ],
+
+        "temperature":
+            0,
+
+        "response_format": {
+            "type":
+                "json_object",
+        },
+    }
+
+    headers = {
+        "Authorization":
+            f"Bearer {OPENROUTER_API_KEY}",
+
+        "Content-Type":
+            "application/json",
+
+        "HTTP-Referer":
+            "http://localhost:3000",
+
+        "X-Title":
+            "FlowOne Copilot Local POC",
+    }
+
+    timeout = httpx.Timeout(
+        connect=20.0,
+        read=60.0,
+        write=20.0,
+        pool=20.0,
+    )
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+    ) as client:
+        response = await client.post(
+            OPENROUTER_URL,
+            headers=headers,
+            json=body,
+        )
+
+        if (
+            response.status_code
+            >= 400
+        ):
+            return {
+                "intent":
+                    "ANSWER",
+
+                "resource":
+                    None,
+            }
+
+        data = (
+            response.json()
+        )
+
+    content = (
+        data
+        .get(
+            "choices",
+            [{}],
+        )[0]
+        .get(
+            "message",
+            {},
+        )
+        .get(
+            "content",
+            ""
+        )
+    )
+
+    try:
+        result = json.loads(
+            content
+        )
+    except (
+        json.JSONDecodeError,
+        TypeError,
+    ):
+        return {
+            "intent":
+                "ANSWER",
+
+            "resource":
+                None,
+        }
+
+    intent = str(
+        result.get(
+            "intent",
+            "ANSWER",
+        )
+    ).upper()
+
+    resource = (
+        result.get(
+            "resource"
+        )
+    )
+
+    if (
+        intent ==
+        "SHOW"
+        and resource ==
+        "overdue_customers"
+    ):
+        return {
+            "intent":
+                "SHOW",
+
+            "resource":
+                "overdue_customers",
+        }
+
+    return {
+        "intent":
+            "ANSWER",
+
+        "resource":
+            None,
+    }
+
+
+# =========================================================
+# MODEL MESSAGES
+# =========================================================
+
+def build_model_messages(
+    payload: dict[str, Any],
+) -> list[dict[str, str]]:
+    state = (
+        payload.get(
+            "state"
+        )
+        or {}
+    )
+
+    flowone_context = (
+        build_flowone_context(
+            state
+        )
+    )
+
+    system_prompt = f"""
+You are FlowOne Copilot.
+
+You assist employees using the FlowOne subscriber application.
+
+You are currently running as a local proof of concept.
+
+IMPORTANT GROUNDING RULES:
+
+1. The FLOWONE APPLICATION CONTEXT below is the source
+   of truth for the current user, company, legal entity,
+   workspace, business metrics and assigned tasks.
+
+2. Never invent:
+   - customers
+   - invoices
+   - amounts
+   - balances
+   - DSO
+   - CEI
+   - tasks
+   - permissions
+   - roles
+   - business events
+
+3. If information is not present in the FlowOne context,
+   clearly say that the information is not currently
+   available to you.
+
+4. Do not claim that you performed an action unless an
+   application tool actually confirms that action.
+
+5. Do not claim that emails, reminders, payments,
+   approvals or transactions were sent or executed.
+
+6. When the user asks:
+   - "what needs my attention"
+   - "what should I focus on"
+   - "what should I work on"
+   - "what are my priorities"
+
+   ALWAYS structure the answer using the available
+   FlowOne context in this order:
+
+   A. LIVE BUSINESS SIGNALS
+      Report factual business metrics that are present
+      in context, such as:
+      - overdue receivables
+      - overdue percentage
+      - DSO
+      - CEI
+      - net exposure
+
+   B. CURRENT FOCUS
+      Use the supplied My Work focus areas.
+
+   C. ASSIGNED TASKS
+      Mention assigned workflow tasks when present.
+      If none are present, say that no assigned
+      FlowOne tasks are currently available.
+
+7. Distinguish factual signals from recommendations.
+
+8. Do not invent thresholds, risk classifications,
+   urgency levels or targets.
+
+9. Be concise and useful for an enterprise application.
+
+CURRENT FLOWONE APPLICATION CONTEXT:
+
+{flowone_context}
+""".strip()
+
+    model_messages: list[
+        dict[str, str]
+    ] = [
+        {
+            "role":
+                "system",
+
+            "content":
+                system_prompt,
+        }
+    ]
+
+    incoming_messages = (
+        payload.get(
+            "messages"
+        )
+        or []
+    )
+
+    for message in incoming_messages:
+        if not isinstance(
+            message,
+            dict,
+        ):
+            continue
+
+        role = (
+            message.get(
+                "role"
+            )
+        )
+
+        if role not in {
+            "user",
+            "assistant",
+        }:
+            continue
+
+        content = extract_text(
+            message.get(
+                "content"
+            )
+        )
+
+        if not content:
+            continue
+
+        model_messages.append(
+            {
+                "role":
+                    role,
+
+                "content":
+                    content,
+            }
+        )
+
+    return model_messages
+
+
+# =========================================================
+# OPENROUTER STREAM
+# =========================================================
+
+async def stream_openrouter(
+    model_messages: list[
+        dict[str, str]
+    ],
+):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not configured."
+        )
+
+    headers = {
+        "Authorization":
+            f"Bearer {OPENROUTER_API_KEY}",
+
+        "Content-Type":
+            "application/json",
+
+        "HTTP-Referer":
+            "http://localhost:3000",
+
+        "X-Title":
+            "FlowOne Copilot Local POC",
+    }
+
+    body = {
+        "model":
+            OPENROUTER_MODEL,
+
+        "messages":
+            model_messages,
+
+        "stream":
+            True,
+
+        "temperature":
+            0.2,
+    }
+
+    timeout = httpx.Timeout(
+        connect=20.0,
+        read=None,
+        write=20.0,
+        pool=20.0,
+    )
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+    ) as client:
+
+        async with client.stream(
+            "POST",
+            OPENROUTER_URL,
+            headers=headers,
+            json=body,
+        ) as response:
+
+            if (
+                response.status_code
+                >= 400
+            ):
+                error_body = (
+                    await response.aread()
+                )
+
+                raise RuntimeError(
+                    "OpenRouter request failed "
+                    f"with status "
+                    f"{response.status_code}: "
+                    f"{error_body.decode(errors='ignore')}"
+                )
+
+            async for line in (
+                response.aiter_lines()
+            ):
+                if not line:
+                    continue
+
+                if not line.startswith(
+                    "data:"
+                ):
+                    continue
+
+                data = (
+                    line[5:]
+                    .strip()
+                )
+
+                if (
+                    data ==
+                    "[DONE]"
+                ):
+                    break
+
+                try:
+                    chunk = (
+                        json.loads(
+                            data
+                        )
+                    )
+                except (
+                    json.JSONDecodeError
+                ):
+                    continue
+
+                choices = (
+                    chunk.get(
+                        "choices"
+                    )
+                    or []
+                )
+
+                if not choices:
+                    continue
+
+                delta = (
+                    choices[0]
+                    .get(
+                        "delta",
+                        {},
+                    )
+                    .get(
+                        "content"
+                    )
+                )
+
+                if (
+                    isinstance(
+                        delta,
+                        str,
+                    )
+                    and delta
+                ):
+                    yield delta
+
+
+# =========================================================
+# SMALL AG-UI TEXT RESPONSE HELPER
+# =========================================================
+
+async def stream_static_message(
+    message_id: str,
+    text: str,
+):
+    yield encode_sse(
+        {
+            "type":
+                "TEXT_MESSAGE_START",
+
+            "messageId":
+                message_id,
+
+            "role":
+                "assistant",
+        }
+    )
+
+    yield encode_sse(
+        {
+            "type":
+                "TEXT_MESSAGE_CONTENT",
+
+            "messageId":
+                message_id,
+
+            "delta":
+                text,
+        }
+    )
+
+    yield encode_sse(
+        {
+            "type":
+                "TEXT_MESSAGE_END",
+
+            "messageId":
+                message_id,
+        }
+    )
+
+
+# =========================================================
+# AG-UI ENDPOINT
+# =========================================================
+
+@app.post("/agent")
+async def run_agent(
+    request: Request,
+):
+    payload = (
+        await request.json()
+    )
+
+    thread_id = (
+        payload.get(
+            "threadId"
+        )
+        or str(
+            uuid.uuid4()
+        )
+    )
+
+    run_id = (
+        payload.get(
+            "runId"
+        )
+        or str(
+            uuid.uuid4()
+        )
+    )
+
+    message_id = str(
+        uuid.uuid4()
+    )
+
+    async def event_stream():
+        yield encode_sse(
+            {
+                "type":
+                    "RUN_STARTED",
+
+                "threadId":
+                    thread_id,
+
+                "runId":
+                    run_id,
+            }
+        )
+
+        try:
+            # =========================================
+            # INTENT CLASSIFICATION
+            # =========================================
+
+            yield encode_sse(
+                {
+                    "type":
+                        "STEP_STARTED",
+
+                    "stepName":
+                        "Classifying request",
+                }
+            )
+
+            intent_result = (
+                await classify_intent(
+                    payload
+                )
+            )
+
+            yield encode_sse(
+                {
+                    "type":
+                        "STEP_FINISHED",
+
+                    "stepName":
+                        "Classifying request",
+                }
+            )
+
+            # =========================================
+            # SHOW INTENT:
+            # OVERDUE CUSTOMERS
+            # =========================================
+
+            if (
+                intent_result.get(
+                    "intent"
+                )
+                ==
+                "SHOW"
+                and
+                intent_result.get(
+                    "resource"
+                )
+                ==
+                "overdue_customers"
+            ):
+              
+                # The backend deliberately does NOT fetch FlowOne
+                # customer data.
+                #
+                # It asks the authenticated frontend to do it.
+                yield encode_sse(
+                    {
+                        "type":
+                            "CUSTOM",
+
+                        "name":
+                            "SHOW_OVERDUE_CUSTOMERS",
+
+                        "value": {
+                            "resource":
+                                "overdue_customers",
+
+                            "limit":
+                                5,
+                        },
+                    }
+                )
+
+                async for event in (
+                    stream_static_message(
+                        message_id,
+                        (
+                            "Here are the overdue customers "
+                            "from your current FlowOne context."
+                        ),
+                    )
+                ):
+                    yield event
+
+                yield encode_sse(
+                    {
+                        "type":
+                            "RUN_FINISHED",
+
+                        "threadId":
+                            thread_id,
+
+                        "runId":
+                            run_id,
+                    }
+                )
+
+                return
+
+            # =========================================
+            # NORMAL ANSWER INTENT
+            # =========================================
+
+            yield encode_sse(
+                {
+                    "type":
+                        "STEP_STARTED",
+
+                    "stepName":
+                        "Understanding FlowOne context",
+                }
+            )
+
+            model_messages = (
+                build_model_messages(
+                    payload
+                )
+            )
+
+            yield encode_sse(
+                {
+                    "type":
+                        "STEP_FINISHED",
+
+                    "stepName":
+                        "Understanding FlowOne context",
+                }
+            )
+
+            yield encode_sse(
+                {
+                    "type":
+                        "TEXT_MESSAGE_START",
+
+                    "messageId":
+                        message_id,
+
+                    "role":
+                        "assistant",
+                }
+            )
+
+            async for delta in (
+                stream_openrouter(
+                    model_messages
+                )
+            ):
+                yield encode_sse(
+                    {
+                        "type":
+                            "TEXT_MESSAGE_CONTENT",
+
+                        "messageId":
+                            message_id,
+
+                        "delta":
+                            delta,
+                    }
+                )
+
+            yield encode_sse(
+                {
+                    "type":
+                        "TEXT_MESSAGE_END",
+
+                    "messageId":
+                        message_id,
+                }
+            )
+
+            yield encode_sse(
+                {
+                    "type":
+                        "RUN_FINISHED",
+
+                    "threadId":
+                        thread_id,
+
+                    "runId":
+                        run_id,
+                }
+            )
+
+        except Exception as error:
+            yield encode_sse(
+                {
+                    "type":
+                        "RUN_ERROR",
+
+                    "threadId":
+                        thread_id,
+
+                    "runId":
+                        run_id,
+
+                    "message":
+                        str(
+                            error
+                        ),
+                }
+            )
+
+    return StreamingResponse(
+        event_stream(),
+
+        media_type=
+            "text/event-stream",
+
+        headers={
+            "Cache-Control":
+                "no-cache",
+
+            "Connection":
+                "keep-alive",
+
+            "X-Accel-Buffering":
+                "no",
+        },
+    )
