@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Mapping
 
 from flowone import DailyArToolService, FlowOneApiError
+from models import (
+    BusinessCase,
+    CaseRecommendation,
+    EvidenceItem,
+    ToolExecution,
+    WorkerRun,
+    collect_record_ids,
+)
 from .registry import WorkerAccess
 
 
@@ -85,10 +94,7 @@ def _customer_name_matches(row: Mapping[str, Any], customer: Mapping[str, Any]) 
 
 
 def _format_compact_currency(value: float, currency_code: str) -> str:
-    """
-    Backend-only explanatory formatting. Numeric values stay authoritative in the
-    result payload and are formatted by the FlowOne UI for cards/tables.
-    """
+    """Formatting for explanations only; numeric values remain authoritative."""
 
     code = (currency_code or "USD").upper()
     symbols = {
@@ -145,6 +151,153 @@ class DailyArPrioritiesWorker:
             for step in STEP_DEFINITIONS
         ]
 
+    def _source_available(self, tool_id: str) -> bool:
+        return tool_id in set(self.access.permitted_tools)
+
+    def _build_case_evidence(
+        self,
+        *,
+        case_id: str,
+        observed_at: str,
+        customer: Mapping[str, Any],
+        matching_invoices: list[dict[str, Any]],
+        matching_payments: list[dict[str, Any]],
+        matching_credit_notes: list[dict[str, Any]],
+        matching_tasks: list[dict[str, Any]],
+        open_invoice_balance: float,
+        recent_payment_amount: float,
+        credit_note_amount: float,
+        source_statuses: Mapping[str, str],
+    ) -> list[EvidenceItem]:
+        evidence: list[EvidenceItem] = []
+        past_due = _number(customer.get("pastDueInvBal"))
+        dso = _number(customer.get("dso"))
+        customer_record_id = str(
+            customer.get("customerId")
+            or customer.get("customerNum")
+            or customer.get("customerName")
+            or ""
+        )
+
+        evidence.append(
+            EvidenceItem(
+                evidence_id=f"{case_id}:exposure",
+                source_system="FlowOne",
+                source_type="flowone_tool",
+                tool_id="get_overdue_customers",
+                record_type="customer_exposure",
+                status="observed",
+                scope="bulk_scan",
+                observed_at=observed_at,
+                summary=(
+                    "Current FlowOne customer exposure reported "
+                    f"{_format_compact_currency(past_due, self.currency_code)} past due "
+                    f"and {round(dso)} DSO days."
+                ),
+                record_ids=(customer_record_id,) if customer_record_id else (),
+                facts={
+                    "pastDueInvBal": past_due,
+                    "dso": dso,
+                    "customerId": str(customer.get("customerId") or ""),
+                    "customerNum": str(customer.get("customerNum") or ""),
+                },
+            )
+        )
+
+        source_specs: tuple[
+            tuple[str, str, list[dict[str, Any]], tuple[str, ...], dict[str, Any]], ...
+        ] = (
+            (
+                "get_unpaid_invoices",
+                "invoice",
+                matching_invoices,
+                ("invoiceId", "invoiceNum", "formatNumber", "id"),
+                {
+                    "recordCount": len(matching_invoices),
+                    "openInvoiceBalance": open_invoice_balance,
+                },
+            ),
+            (
+                "get_customer_payments",
+                "payment",
+                matching_payments,
+                ("paymentId", "receiptReferenceNum", "id"),
+                {
+                    "recordCount": len(matching_payments),
+                    "recentPaymentAmount": recent_payment_amount,
+                },
+            ),
+            (
+                "get_credit_notes",
+                "credit_note",
+                matching_credit_notes,
+                ("creditNoteId", "creditNoteNum", "id"),
+                {
+                    "recordCount": len(matching_credit_notes),
+                    "creditNoteAmount": credit_note_amount,
+                },
+            ),
+            (
+                "get_assigned_tasks",
+                "task",
+                matching_tasks,
+                ("taskId", "id", "taskName"),
+                {"recordCount": len(matching_tasks)},
+            ),
+        )
+
+        labels = {
+            "get_unpaid_invoices": "invoice",
+            "get_customer_payments": "payment",
+            "get_credit_notes": "credit-note",
+            "get_assigned_tasks": "assigned task",
+        }
+
+        for tool_id, record_type, records, id_keys, facts in source_specs:
+            available = self._source_available(tool_id)
+            source_status = source_statuses.get(tool_id, "unknown")
+            if not available or source_status == "skipped":
+                status = "unavailable"
+                summary = (
+                    f"{labels[tool_id].capitalize()} evidence was not available to the "
+                    "current FlowOne permission set."
+                )
+            elif source_status == "error":
+                status = "error"
+                summary = (
+                    f"The FlowOne {labels[tool_id]} lookup failed during this worker run; "
+                    "absence of records must not be treated as negative evidence."
+                )
+            elif records:
+                status = "observed"
+                summary = (
+                    f"{len(records)} matching {labels[tool_id]} "
+                    f"{'record' if len(records) == 1 else 'records'} found in the current FlowOne scope."
+                )
+            else:
+                status = "no_match"
+                summary = (
+                    f"No matching {labels[tool_id]} records were found in the current FlowOne scope."
+                )
+
+            evidence.append(
+                EvidenceItem(
+                    evidence_id=f"{case_id}:{record_type}",
+                    source_system="FlowOne",
+                    source_type="flowone_tool",
+                    tool_id=tool_id,
+                    record_type=record_type,
+                    status=status,
+                    scope="bulk_scan",
+                    observed_at=observed_at,
+                    summary=summary,
+                    record_ids=collect_record_ids(records, id_keys),
+                    facts=facts,
+                )
+            )
+
+        return evidence
+
     def build_priority_cases(
         self,
         overdue_customers: list[dict[str, Any]],
@@ -152,6 +305,10 @@ class DailyArPrioritiesWorker:
         payments: list[dict[str, Any]],
         credit_notes: list[dict[str, Any]],
         tasks: list[dict[str, Any]],
+        *,
+        run_id: str,
+        observed_at: str,
+        source_statuses: Mapping[str, str],
     ) -> list[dict[str, Any]]:
         cases: list[dict[str, Any]] = []
         can_view_payments = bool(self.capabilities.get("canViewPayments"))
@@ -234,48 +391,116 @@ class DailyArPrioritiesWorker:
                     f"{len(matching_tasks)} assigned {noun} reference this customer."
                 )
 
-            cases.append(
-                {
-                    "id": str(
-                        customer.get("customerId")
-                        or customer.get("customerNum")
-                        or customer.get("customerName")
-                        or ""
+            recommended_next_step = (
+                "Review the account context and prepare a collection follow-up "
+                "if the evidence supports outreach."
+                if can_manage_collections
+                else "Review the account context and route any required follow-up "
+                "to a user with collection-management permission."
+            )
+
+            case_id = str(uuid.uuid4())
+            evidence = self._build_case_evidence(
+                case_id=case_id,
+                observed_at=observed_at,
+                customer=customer,
+                matching_invoices=matching_invoices,
+                matching_payments=matching_payments,
+                matching_credit_notes=matching_credit_notes,
+                matching_tasks=matching_tasks,
+                open_invoice_balance=open_invoice_balance,
+                recent_payment_amount=recent_payment_amount,
+                credit_note_amount=credit_note_amount,
+                source_statuses=source_statuses,
+            )
+
+            business_case = BusinessCase(
+                case_id=case_id,
+                case_type="ar_collection_priority",
+                status="open",
+                created_by_worker="daily_ar_priorities",
+                created_from_run_id=run_id,
+                created_at=observed_at,
+                subject={
+                    "type": "customer",
+                    "id": str(customer.get("customerId") or ""),
+                    "name": str(customer.get("customerName") or ""),
+                    "reference": str(customer.get("customerNum") or ""),
+                },
+                summary=(
+                    f"{str(customer.get('customerName') or 'Customer')} has "
+                    f"{_format_compact_currency(past_due, self.currency_code)} past due"
+                    + (f" with {round(dso)} DSO days." if dso > 0 else ".")
+                ),
+                reasons=reasons,
+                recommendation=CaseRecommendation(
+                    action_key=(
+                        "prepare_collection_followup"
+                        if can_manage_collections
+                        else "review_and_route"
                     ),
-                    "customerId": str(customer.get("customerId") or ""),
-                    "customerName": str(customer.get("customerName") or ""),
-                    "customerNum": str(customer.get("customerNum") or ""),
+                    label=(
+                        "Prepare collection follow-up"
+                        if can_manage_collections
+                        else "Review and route"
+                    ),
+                    description=recommended_next_step,
+                    external_impact=False,
+                    # Follow-up preparation is internal, but any eventual
+                    # customer-facing execution remains human/policy gated.
+                    requires_human_approval=can_manage_collections,
+                ),
+                evidence=evidence,
+                tags=("accounts_receivable", "collections", "daily_ar"),
+                metadata={
+                    "currencyCode": self.currency_code,
                     "pastDueInvBal": past_due,
                     "dso": dso,
                     "openInvoiceCount": len(matching_invoices),
-                    "openInvoiceBalance": open_invoice_balance,
                     "recentPaymentCount": len(matching_payments),
-                    "latestPaymentDate": str(
-                        (matching_payments[0] if matching_payments else {}).get(
-                            "paymentDate", ""
-                        )
-                        or ""
-                    ),
-                    "recentPaymentAmount": recent_payment_amount,
                     "creditNoteCount": len(matching_credit_notes),
-                    "creditNoteAmount": credit_note_amount,
                     "matchingTaskCount": len(matching_tasks),
-                    "reasons": reasons,
-                    "recommendedNextStep": (
-                        "Review the account context and prepare a collection follow-up "
-                        "if the evidence supports outreach."
-                        if can_manage_collections
-                        else "Review the account context and route any required follow-up "
-                        "to a user with collection-management permission."
-                    ),
-                    "canPrepareFollowup": can_manage_collections,
-                    "invoices": matching_invoices[:20],
-                    "payments": matching_payments[:20],
-                    "creditNotes": matching_credit_notes[:20],
-                    "tasks": matching_tasks[:10],
-                    "evidenceMode": "bulk_scan",
-                }
+                },
             )
+
+            # Compatibility fields are intentionally preserved so the stable
+            # React work surface can render Feature 4 without a redesign.
+            case_payload: dict[str, Any] = {
+                "id": str(
+                    customer.get("customerId")
+                    or customer.get("customerNum")
+                    or customer.get("customerName")
+                    or ""
+                ),
+                "customerId": str(customer.get("customerId") or ""),
+                "customerName": str(customer.get("customerName") or ""),
+                "customerNum": str(customer.get("customerNum") or ""),
+                "pastDueInvBal": past_due,
+                "dso": dso,
+                "openInvoiceCount": len(matching_invoices),
+                "openInvoiceBalance": open_invoice_balance,
+                "recentPaymentCount": len(matching_payments),
+                "latestPaymentDate": str(
+                    (matching_payments[0] if matching_payments else {}).get(
+                        "paymentDate", ""
+                    )
+                    or ""
+                ),
+                "recentPaymentAmount": recent_payment_amount,
+                "creditNoteCount": len(matching_credit_notes),
+                "creditNoteAmount": credit_note_amount,
+                "matchingTaskCount": len(matching_tasks),
+                "reasons": reasons,
+                "recommendedNextStep": recommended_next_step,
+                "canPrepareFollowup": can_manage_collections,
+                "invoices": matching_invoices[:20],
+                "payments": matching_payments[:20],
+                "creditNotes": matching_credit_notes[:20],
+                "tasks": matching_tasks[:10],
+                "evidenceMode": "bulk_scan",
+            }
+            case_payload.update(business_case.to_dict())
+            cases.append(case_payload)
 
         cases.sort(
             key=lambda case: (
@@ -304,6 +529,18 @@ class DailyArPrioritiesWorker:
             "get_assigned_tasks": [],
         }
         skipped_sources: list[str] = []
+        tool_executions: list[ToolExecution] = []
+        source_statuses: dict[str, str] = {
+            tool_id: "pending" for tool_id in source_records
+        }
+
+        detail_labels = {
+            "get_overdue_customers": "scoped overdue customer records",
+            "get_unpaid_invoices": "open invoice records",
+            "get_customer_payments": "recent payment records",
+            "get_credit_notes": "credit-note records",
+            "get_assigned_tasks": "assigned task records",
+        }
 
         for step in STEP_DEFINITIONS[:-1]:
             step_id = step["id"]
@@ -313,18 +550,33 @@ class DailyArPrioritiesWorker:
 
             if tool_id in denied:
                 skipped_sources.append(source_label)
+                source_statuses[tool_id] = "skipped"
+                now = utc_now_iso()
+                detail = "Not available to the current permission set"
+                tool_executions.append(
+                    ToolExecution(
+                        tool_id=tool_id,
+                        status="skipped",
+                        started_at=now,
+                        completed_at=now,
+                        record_count=0,
+                        detail=detail,
+                        error_code="permission_denied",
+                    )
+                )
                 yield {
                     "kind": "step",
                     "id": step_id,
                     "label": label,
                     "status": "skipped",
-                    "detail": "Not available to the current permission set",
+                    "detail": detail,
                 }
                 continue
 
             if tool_id not in permitted:
                 continue
 
+            tool_started = utc_now_iso()
             yield {
                 "kind": "step",
                 "id": step_id,
@@ -335,28 +587,48 @@ class DailyArPrioritiesWorker:
             try:
                 result = await self.tools.run_tool(tool_id)
                 source_records[tool_id] = result.records
-                detail_labels = {
-                    "get_overdue_customers": "scoped overdue customer records",
-                    "get_unpaid_invoices": "open invoice records",
-                    "get_customer_payments": "recent payment records",
-                    "get_credit_notes": "credit-note records",
-                    "get_assigned_tasks": "assigned task records",
-                }
+                source_statuses[tool_id] = "completed"
+                tool_completed = utc_now_iso()
+                detail = f"{result.count} {detail_labels[tool_id]}"
+                tool_executions.append(
+                    ToolExecution(
+                        tool_id=tool_id,
+                        status="completed",
+                        started_at=tool_started,
+                        completed_at=tool_completed,
+                        record_count=result.count,
+                        detail=detail,
+                    )
+                )
                 yield {
                     "kind": "step",
                     "id": step_id,
                     "label": label,
                     "status": "done",
-                    "detail": f"{result.count} {detail_labels[tool_id]}",
+                    "detail": detail,
                 }
             except (FlowOneApiError, KeyError) as error:
+                source_statuses[tool_id] = "error"
+                tool_completed = utc_now_iso()
                 if tool_id == "get_overdue_customers":
+                    detail = "Customer exposure lookup failed"
+                    tool_executions.append(
+                        ToolExecution(
+                            tool_id=tool_id,
+                            status="error",
+                            started_at=tool_started,
+                            completed_at=tool_completed,
+                            record_count=0,
+                            detail=detail,
+                            error_code="flowone_lookup_failed",
+                        )
+                    )
                     yield {
                         "kind": "step",
                         "id": step_id,
                         "label": label,
                         "status": "error",
-                        "detail": "Customer exposure lookup failed",
+                        "detail": detail,
                     }
                     raise DailyArWorkerError(
                         "Daily AR Priorities could not complete because the current "
@@ -369,12 +641,24 @@ class DailyArPrioritiesWorker:
                     "get_credit_notes": "Credit-note lookup failed; worker continued without this context",
                     "get_assigned_tasks": "Task lookup failed; worker continued without task context",
                 }
+                detail = error_details.get(tool_id, "FlowOne lookup failed")
+                tool_executions.append(
+                    ToolExecution(
+                        tool_id=tool_id,
+                        status="error",
+                        started_at=tool_started,
+                        completed_at=tool_completed,
+                        record_count=0,
+                        detail=detail,
+                        error_code="flowone_lookup_failed",
+                    )
+                )
                 yield {
                     "kind": "step",
                     "id": step_id,
                     "label": label,
                     "status": "error",
-                    "detail": error_details.get(tool_id, "FlowOne lookup failed"),
+                    "detail": detail,
                 }
 
         prioritize = STEP_DEFINITIONS[-1]
@@ -385,12 +669,16 @@ class DailyArPrioritiesWorker:
             "status": "running",
         }
 
+        observed_at = utc_now_iso()
         cases = self.build_priority_cases(
             source_records["get_overdue_customers"],
             source_records["get_unpaid_invoices"],
             source_records["get_customer_payments"],
             source_records["get_credit_notes"],
             source_records["get_assigned_tasks"],
+            run_id=run_id,
+            observed_at=observed_at,
+            source_statuses=source_statuses,
         )
 
         yield {
@@ -402,26 +690,46 @@ class DailyArPrioritiesWorker:
         }
 
         completed = utc_now_iso()
-        run = {
-            "workerId": "daily_ar_priorities",
-            "runId": run_id,
-            "status": "completed",
-            "startedAt": started,
-            "completedAt": completed,
-            "cases": cases,
-            "sourceCounts": {
-                "overdueCustomers": len(source_records["get_overdue_customers"]),
-                "unpaidInvoices": len(source_records["get_unpaid_invoices"]),
-                "payments": len(source_records["get_customer_payments"]),
-                "creditNotes": len(source_records["get_credit_notes"]),
-                "tasks": len(source_records["get_assigned_tasks"]),
-            },
-            "skippedSources": skipped_sources,
-            "note": (
-                "POC prioritization is transparent: cases are ordered by current "
-                "past-due exposure, then DSO, then open-invoice balance. No company "
-                "policy threshold is invented."
-            ),
+        source_counts = {
+            "overdueCustomers": len(source_records["get_overdue_customers"]),
+            "unpaidInvoices": len(source_records["get_unpaid_invoices"]),
+            "payments": len(source_records["get_customer_payments"]),
+            "creditNotes": len(source_records["get_credit_notes"]),
+            "tasks": len(source_records["get_assigned_tasks"]),
         }
+        note = (
+            "POC prioritization is transparent: cases are ordered by current "
+            "past-due exposure, then DSO, then open-invoice balance. No company "
+            "policy threshold is invented."
+        )
+
+        canonical_run = WorkerRun(
+            run_id=run_id,
+            worker_id=self.access.worker.id,
+            worker_label=self.access.worker.label,
+            status="completed",
+            trigger_type=self.access.worker.trigger,
+            started_at=started,
+            completed_at=completed,
+            case_ids=[str(case.get("caseId") or "") for case in cases],
+            tool_executions=tool_executions,
+            metadata={
+                "sourceCounts": source_counts,
+                "skippedSources": skipped_sources,
+                "prioritization": "past_due_then_dso_then_open_invoice_balance",
+            },
+        )
+
+        # Preserve the stable Feature 3 payload while adding the canonical
+        # worker-run envelope that future workers will share.
+        run = canonical_run.to_dict()
+        run.update(
+            {
+                "cases": cases,
+                "sourceCounts": source_counts,
+                "skippedSources": skipped_sources,
+                "note": note,
+            }
+        )
 
         yield {"kind": "result", "run": run}

@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import re
 import uuid
@@ -40,7 +40,7 @@ OPENROUTER_URL = os.getenv(
 
 app = FastAPI(
     title="FlowOne Copilot Runtime",
-    version="0.8.0",
+    version="0.9.0",
 )
 
 app.add_middleware(
