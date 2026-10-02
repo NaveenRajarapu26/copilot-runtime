@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
@@ -49,6 +50,7 @@ class FlowOneRequestContext:
     authorization: str = field(repr=False)
     core_api_url: str
     company_id: str
+    actor_key: str | None = field(default=None, repr=False)
     user_pool_id: str | None = None
     legal_entity_id: str | None = None
     gst_number: str | None = None
@@ -77,12 +79,34 @@ class FlowOneRequestContext:
             authorization=f"Bearer {bearer_value}",
             core_api_url=_resolve_core_api_url(request),
             company_id=company_id,
+            actor_key=_clean(request.headers.get("X-FlowOne-Actor-Key")) or None,
             user_pool_id=_clean(request.headers.get("X-ALGO-UP-ID")) or None,
             legal_entity_id=_clean(request.headers.get("X-Legal-Entity-Id")) or None,
             gst_number=_clean(request.headers.get("X-GST-Number")) or None,
             portfolio_id=_clean(request.headers.get("X-FlowOne-Portfolio-Id")) or None,
             user_scope_access=_clean(request.headers.get("X-FlowOne-User-Scope")),
         )
+
+
+    def persistence_scope_id(self) -> str:
+        """Stable, non-secret isolation key for backend state.
+
+        The raw actor key (currently derived from the signed-in FlowOne user +
+        legal entity by core-ui) is never written to the database. Only this
+        SHA-256 digest is persisted.
+        """
+
+        actor = self.actor_key or self.user_pool_id or "flowone-user"
+        raw = "|".join(
+            [
+                actor,
+                self.company_id,
+                self.legal_entity_id or "",
+                self.portfolio_id or "",
+                self.user_scope_access or "",
+            ]
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def upstream_headers(self) -> dict[str, str]:
         headers = {

@@ -2,3 +2,7 @@
 __pycache__/
 .env
 *.pyc
+.flowone/
+*.db
+*.db-shm
+*.db-wal

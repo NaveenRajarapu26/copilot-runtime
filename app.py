@@ -2,15 +2,18 @@ import json
 import os
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from agents import DailyArPrioritiesWorker, DailyArWorkerError, resolve_worker_access
+from persistence import SQLiteStateStore
+
 from flowone import (
     DailyArToolService,
     FlowOneApiError,
@@ -33,6 +36,12 @@ OPENROUTER_URL = os.getenv(
     "https://openrouter.ai/api/v1/chat/completions",
 ).strip()
 
+STATE_DB_PATH = os.getenv(
+    "FLOWONE_STATE_DB_PATH",
+    os.path.join(os.path.dirname(__file__), ".flowone", "agent_state.db"),
+).strip()
+STATE_STORE = SQLiteStateStore(STATE_DB_PATH)
+
 
 # =========================================================
 # APP
@@ -40,7 +49,7 @@ OPENROUTER_URL = os.getenv(
 
 app = FastAPI(
     title="FlowOne Copilot Runtime",
-    version="0.9.0",
+    version="0.10.0",
 )
 
 app.add_middleware(
@@ -63,9 +72,172 @@ async def health() -> dict[str, Any]:
         "mode": "local-poc",
         "model": OPENROUTER_MODEL,
         "openrouterConfigured": bool(OPENROUTER_API_KEY),
-        "runtimeVersion": "0.8.0",
+        "runtimeVersion": "0.10.0",
         "flowOneApiClient": "request-scoped",
+        "statePersistence": "sqlite-local",
     }
+
+
+# =========================================================
+# FEATURE 5: DURABLE BACKEND STATE
+# =========================================================
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def persistence_scope(request: Request) -> tuple[FlowOneRequestContext, str]:
+    try:
+        context = FlowOneRequestContext.from_request(request)
+    except FlowOneContextError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    return context, context.persistence_scope_id()
+
+
+@app.get("/state/runs/latest")
+async def get_latest_worker_run(request: Request, workerId: str) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    run = STATE_STORE.worker_runs.latest(scope_id, workerId)
+    return {"run": run}
+
+
+@app.get("/state/runs")
+async def list_worker_runs(
+    request: Request,
+    workerId: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    return {"runs": STATE_STORE.worker_runs.list(scope_id, workerId, limit)}
+
+
+@app.get("/state/runs/{run_id}")
+async def get_worker_run(request: Request, run_id: str) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    run = STATE_STORE.worker_runs.get(scope_id, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Worker run not found.")
+    return {"run": run}
+
+
+@app.get("/state/cases")
+async def list_cases(
+    request: Request,
+    status: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    return {"cases": STATE_STORE.cases.list(scope_id, status, limit)}
+
+
+@app.get("/state/cases/{case_id}")
+async def get_case(request: Request, case_id: str) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    case = STATE_STORE.cases.get(scope_id, case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found.")
+    return {"case": case}
+
+
+@app.put("/state/cases/{case_id}")
+async def upsert_case(request: Request, case_id: str) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    body = await request.json()
+    case = body.get("case") if isinstance(body, dict) else None
+    if not isinstance(case, dict):
+        raise HTTPException(status_code=400, detail="Request must contain a case object.")
+    if str(case.get("caseId") or "") != case_id:
+        raise HTTPException(status_code=400, detail="caseId does not match the route.")
+    STATE_STORE.cases.save(scope_id, case)
+    return {"case": STATE_STORE.cases.get(scope_id, case_id)}
+
+
+@app.get("/state/journeys/latest")
+async def get_latest_journey(
+    request: Request,
+    journeyType: str | None = None,
+) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    journey = STATE_STORE.journeys.latest_active(scope_id, journeyType)
+    return {"journey": journey}
+
+
+@app.get("/state/journeys")
+async def list_journeys(request: Request, limit: int = 20) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    return {"journeys": STATE_STORE.journeys.list(scope_id, limit)}
+
+
+@app.put("/state/journeys/{journey_id}")
+async def upsert_journey(request: Request, journey_id: str) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    body = await request.json()
+    journey = body.get("journey") if isinstance(body, dict) else None
+    if not isinstance(journey, dict):
+        raise HTTPException(status_code=400, detail="Request must contain a journey object.")
+    if str(journey.get("id") or journey.get("journeyId") or "") != journey_id:
+        raise HTTPException(status_code=400, detail="Journey id does not match the route.")
+    STATE_STORE.journeys.save(scope_id, journey)
+    return {"journey": STATE_STORE.journeys.get(scope_id, journey_id)}
+
+
+@app.post("/state/journeys/{journey_id}/cancel")
+async def cancel_journey(request: Request, journey_id: str) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    journey = STATE_STORE.journeys.cancel(scope_id, journey_id, utc_now_iso())
+    if journey is None:
+        raise HTTPException(status_code=404, detail="Journey not found.")
+    return {"journey": journey}
+
+
+@app.get("/state/approvals")
+async def list_approvals(
+    request: Request,
+    status: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    return {"approvals": STATE_STORE.approvals.list(scope_id, status, limit)}
+
+
+@app.post("/state/approvals")
+async def create_approval(request: Request) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    body = await request.json()
+    approval = body.get("approval") if isinstance(body, dict) else None
+    if not isinstance(approval, dict):
+        raise HTTPException(status_code=400, detail="Request must contain an approval object.")
+    journey_id = str(approval.get("journeyId") or "").strip()
+    if not journey_id:
+        raise HTTPException(status_code=400, detail="Approval requires journeyId.")
+    now = utc_now_iso()
+    normalized = dict(approval)
+    normalized.setdefault("approvalId", f"{journey_id}:collection_followup")
+    normalized.setdefault("status", "pending")
+    normalized.setdefault("requestedAt", now)
+    normalized.setdefault("updatedAt", now)
+    STATE_STORE.approvals.save(scope_id, normalized)
+    return {"approval": STATE_STORE.approvals.get_for_journey(scope_id, journey_id)}
+
+
+@app.post("/state/approvals/by-journey/{journey_id}/decision")
+async def decide_approval(request: Request, journey_id: str) -> dict[str, Any]:
+    _, scope_id = persistence_scope(request)
+    body = await request.json()
+    status = str((body or {}).get("status") or "").strip()
+    if status not in {"approved_demo", "approved", "rejected", "cancelled"}:
+        raise HTTPException(status_code=400, detail="Unsupported approval decision status.")
+    approval = STATE_STORE.approvals.decide(
+        scope_id,
+        journey_id,
+        status,
+        utc_now_iso(),
+        (body or {}).get("decision") if isinstance((body or {}).get("decision"), dict) else None,
+    )
+    if approval is None:
+        raise HTTPException(status_code=404, detail="Approval request not found.")
+    return {"approval": approval}
 
 
 # =========================================================
@@ -902,6 +1074,30 @@ async def run_agent(request: Request) -> StreamingResponse:
                     return
 
                 worker_run_id = str(uuid.uuid4())
+                worker_started_at = utc_now_iso()
+                persistence_scope_id = execution_context.persistence_scope_id()
+                STATE_STORE.worker_runs.save(
+                    persistence_scope_id,
+                    {
+                        "schemaVersion": "1.0",
+                        "runType": "worker_run",
+                        "runId": worker_run_id,
+                        "workerId": access.worker.id,
+                        "workerLabel": access.worker.label,
+                        "status": "running",
+                        "triggerType": access.worker.trigger,
+                        "startedAt": worker_started_at,
+                        "completedAt": "",
+                        "caseCount": 0,
+                        "caseIds": [],
+                        "toolExecutions": [],
+                        "runMetadata": {
+                            "permittedTools": list(access.permitted_tools),
+                            "deniedTools": list(access.denied_tools),
+                        },
+                        "cases": [],
+                    },
+                )
                 service = DailyArToolService(FlowOneClient(execution_context))
                 worker = DailyArPrioritiesWorker(
                     tools=service,
@@ -948,6 +1144,12 @@ async def run_agent(request: Request) -> StreamingResponse:
                                 }
                             )
                         elif worker_event.get("kind") == "result":
+                            completed_run = worker_event.get("run")
+                            if isinstance(completed_run, dict):
+                                STATE_STORE.persist_worker_result(
+                                    persistence_scope_id,
+                                    completed_run,
+                                )
                             yield encode_sse(
                                 {
                                     "type": "CUSTOM",
@@ -956,11 +1158,30 @@ async def run_agent(request: Request) -> StreamingResponse:
                                         "workerId": access.worker.id,
                                         "runId": worker_run_id,
                                         "outputResource": access.worker.output_resource,
-                                        "run": worker_event.get("run"),
+                                        "run": completed_run,
                                     },
                                 }
                             )
                 except DailyArWorkerError as error:
+                    STATE_STORE.worker_runs.save(
+                        persistence_scope_id,
+                        {
+                            "schemaVersion": "1.0",
+                            "runType": "worker_run",
+                            "runId": worker_run_id,
+                            "workerId": access.worker.id,
+                            "workerLabel": access.worker.label,
+                            "status": "failed",
+                            "triggerType": access.worker.trigger,
+                            "startedAt": worker_started_at,
+                            "completedAt": utc_now_iso(),
+                            "caseCount": 0,
+                            "caseIds": [],
+                            "toolExecutions": [],
+                            "runMetadata": {"error": str(error)},
+                            "cases": [],
+                        },
+                    )
                     yield encode_sse(
                         {
                             "type": "CUSTOM",
