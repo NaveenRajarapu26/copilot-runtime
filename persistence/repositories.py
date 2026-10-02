@@ -68,3 +68,25 @@ class ApprovalRepository(ABC):
 
     @abstractmethod
     def list(self, scope_id: str, status: str | None, limit: int) -> list[dict[str, Any]]: ...
+
+
+class WorkerControlRepository(ABC):
+    @abstractmethod
+    def save(self, scope_id: str, control: Mapping[str, Any]) -> None: ...
+
+    @abstractmethod
+    def get(self, scope_id: str, worker_id: str) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    def list(self, scope_id: str) -> list[dict[str, Any]]: ...
+
+
+class WorkerScheduleRepository(ABC):
+    @abstractmethod
+    def save(self, scope_id: str, schedule: Mapping[str, Any]) -> None: ...
+
+    @abstractmethod
+    def get(self, scope_id: str, worker_id: str) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    def list(self, scope_id: str) -> list[dict[str, Any]]: ...

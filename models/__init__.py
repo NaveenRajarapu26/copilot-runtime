@@ -12,5 +12,9 @@ __all__ = [
     "JourneyRecord",
     "ToolExecution",
     "WorkerRun",
+    "WorkerControl",
+    "WorkerSchedule",
     "collect_record_ids",
 ]
+
+from .operations import WorkerControl, WorkerSchedule

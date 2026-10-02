@@ -2,8 +2,9 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from dotenv import load_dotenv
@@ -11,8 +12,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from agents import DailyArPrioritiesWorker, DailyArWorkerError, resolve_worker_access
+from agents import DailyArPrioritiesWorker, DailyArWorkerError, get_worker, resolve_worker_access
 from persistence import SQLiteStateStore
+from models import WorkerControl, WorkerSchedule
 
 from flowone import (
     DailyArToolService,
@@ -49,7 +51,7 @@ STATE_STORE = SQLiteStateStore(STATE_DB_PATH)
 
 app = FastAPI(
     title="FlowOne Copilot Runtime",
-    version="0.10.0",
+    version="0.11.0",
 )
 
 app.add_middleware(
@@ -72,9 +74,10 @@ async def health() -> dict[str, Any]:
         "mode": "local-poc",
         "model": OPENROUTER_MODEL,
         "openrouterConfigured": bool(OPENROUTER_API_KEY),
-        "runtimeVersion": "0.10.0",
+        "runtimeVersion": "0.11.0",
         "flowOneApiClient": "request-scoped",
         "statePersistence": "sqlite-local",
+        "schedulerMode": "authenticated-session",
     }
 
 
@@ -241,9 +244,252 @@ async def decide_approval(request: Request, journey_id: str) -> dict[str, Any]:
 
 
 # =========================================================
+# FEATURE 6: WORKER OPERATIONS / SCHEDULING
+# =========================================================
+
+
+def _parse_utc_iso(value: str) -> datetime:
+    normalized = str(value or "").strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_schedule_fields(
+    cadence: str,
+    time_local: str,
+    timezone_name: str,
+    day_of_week: int | None,
+) -> ZoneInfo:
+    if cadence not in {"daily", "weekdays", "weekly"}:
+        raise HTTPException(status_code=400, detail="Unsupported worker schedule cadence.")
+
+    if not re.fullmatch(r"\d{2}:\d{2}", time_local):
+        raise HTTPException(status_code=400, detail="timeLocal must use HH:MM format.")
+    hour, minute = (int(part) for part in time_local.split(":"))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise HTTPException(status_code=400, detail="timeLocal is outside the valid clock range.")
+
+    if cadence == "weekly" and (day_of_week is None or not 0 <= day_of_week <= 6):
+        raise HTTPException(status_code=400, detail="Weekly schedules require dayOfWeek from 0 (Monday) to 6 (Sunday).")
+
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as error:
+        raise HTTPException(status_code=400, detail="Unknown schedule timezone.") from error
+
+
+def calculate_next_schedule_run(
+    *,
+    cadence: str,
+    time_local: str,
+    timezone_name: str,
+    day_of_week: int | None,
+    after_utc: datetime | None = None,
+) -> str:
+    tz = _validate_schedule_fields(cadence, time_local, timezone_name, day_of_week)
+    after = (after_utc or datetime.now(timezone.utc)).astimezone(tz)
+    hour, minute = (int(part) for part in time_local.split(":"))
+    candidate = after.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    if cadence == "daily":
+        if candidate <= after:
+            candidate += timedelta(days=1)
+    elif cadence == "weekdays":
+        if candidate <= after:
+            candidate += timedelta(days=1)
+        while candidate.weekday() >= 5:
+            candidate += timedelta(days=1)
+    else:
+        assert day_of_week is not None
+        days_ahead = (day_of_week - after.weekday()) % 7
+        candidate = candidate + timedelta(days=days_ahead)
+        if candidate <= after:
+            candidate += timedelta(days=7)
+
+    return candidate.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+
+
+def ensure_registered_worker(worker_id: str) -> None:
+    if get_worker(worker_id) is None:
+        raise HTTPException(status_code=404, detail="Worker is not registered.")
+
+def get_worker_control(scope_id: str, worker_id: str) -> dict[str, Any]:
+    existing = STATE_STORE.worker_controls.get(scope_id, worker_id)
+    if existing:
+        return existing
+    return WorkerControl(
+        worker_id=worker_id,
+        status="active",
+        updated_at=utc_now_iso(),
+    ).to_dict()
+
+
+@app.get("/state/workers/{worker_id}/operations")
+async def get_worker_operations(request: Request, worker_id: str) -> dict[str, Any]:
+    ensure_registered_worker(worker_id)
+    _, scope_id = persistence_scope(request)
+    return {
+        "control": get_worker_control(scope_id, worker_id),
+        "schedule": STATE_STORE.worker_schedules.get(scope_id, worker_id),
+        "latestRun": STATE_STORE.worker_runs.latest(scope_id, worker_id),
+    }
+
+
+@app.get("/state/workers/{worker_id}/control")
+async def get_worker_control_route(request: Request, worker_id: str) -> dict[str, Any]:
+    ensure_registered_worker(worker_id)
+    _, scope_id = persistence_scope(request)
+    return {"control": get_worker_control(scope_id, worker_id)}
+
+
+@app.put("/state/workers/{worker_id}/control")
+async def update_worker_control(request: Request, worker_id: str) -> dict[str, Any]:
+    ensure_registered_worker(worker_id)
+    _, scope_id = persistence_scope(request)
+    body = await request.json()
+    status = str((body or {}).get("status") or "").strip().lower()
+    if status not in {"active", "paused"}:
+        raise HTTPException(status_code=400, detail="Worker status must be active or paused.")
+
+    now = utc_now_iso()
+    previous = get_worker_control(scope_id, worker_id)
+    control = WorkerControl(
+        worker_id=worker_id,
+        status=status,
+        updated_at=now,
+        paused_at=(now if status == "paused" else previous.get("pausedAt")),
+        resumed_at=(now if status == "active" else previous.get("resumedAt")),
+    ).to_dict()
+    STATE_STORE.worker_controls.save(scope_id, control)
+    return {"control": control}
+
+
+@app.get("/state/workers/{worker_id}/schedule")
+async def get_worker_schedule(request: Request, worker_id: str) -> dict[str, Any]:
+    ensure_registered_worker(worker_id)
+    _, scope_id = persistence_scope(request)
+    return {"schedule": STATE_STORE.worker_schedules.get(scope_id, worker_id)}
+
+
+@app.put("/state/workers/{worker_id}/schedule")
+async def upsert_worker_schedule(request: Request, worker_id: str) -> dict[str, Any]:
+    ensure_registered_worker(worker_id)
+    _, scope_id = persistence_scope(request)
+    body = await request.json()
+    schedule_input = (body or {}).get("schedule") if isinstance(body, dict) else None
+    if not isinstance(schedule_input, dict):
+        raise HTTPException(status_code=400, detail="Request must contain a schedule object.")
+
+    enabled = bool(schedule_input.get("enabled", True))
+    cadence = str(schedule_input.get("cadence") or "daily").strip().lower()
+    time_local = str(schedule_input.get("timeLocal") or "06:00").strip()
+    timezone_name = str(schedule_input.get("timezone") or "UTC").strip()
+    day_raw = schedule_input.get("dayOfWeek")
+    day_of_week = int(day_raw) if day_raw is not None and str(day_raw) != "" else None
+    _validate_schedule_fields(cadence, time_local, timezone_name, day_of_week)
+
+    existing = STATE_STORE.worker_schedules.get(scope_id, worker_id) or {}
+    now = utc_now_iso()
+    next_run_at = (
+        calculate_next_schedule_run(
+            cadence=cadence,
+            time_local=time_local,
+            timezone_name=timezone_name,
+            day_of_week=day_of_week,
+        )
+        if enabled
+        else ""
+    )
+    schedule = WorkerSchedule(
+        schedule_id=str(existing.get("scheduleId") or f"{worker_id}:default"),
+        worker_id=worker_id,
+        enabled=enabled,
+        cadence=cadence,
+        time_local=time_local,
+        timezone=timezone_name,
+        day_of_week=day_of_week,
+        next_run_at=next_run_at,
+        created_at=str(existing.get("createdAt") or now),
+        updated_at=now,
+        last_triggered_at=(
+            str(existing.get("lastTriggeredAt"))
+            if existing.get("lastTriggeredAt")
+            else None
+        ),
+    ).to_dict()
+    STATE_STORE.worker_schedules.save(scope_id, schedule)
+    return {"schedule": schedule}
+
+
+@app.post("/state/workers/{worker_id}/schedule/claim-due")
+async def claim_due_worker_schedule(request: Request, worker_id: str) -> dict[str, Any]:
+    ensure_registered_worker(worker_id)
+    _, scope_id = persistence_scope(request)
+    control = get_worker_control(scope_id, worker_id)
+    if control.get("status") == "paused":
+        return {"due": False, "reason": "worker_paused", "control": control}
+
+    schedule = STATE_STORE.worker_schedules.get(scope_id, worker_id)
+    if not schedule or not bool(schedule.get("enabled")):
+        return {"due": False, "reason": "schedule_disabled", "schedule": schedule}
+
+    next_run_at = str(schedule.get("nextRunAt") or "").strip()
+    if not next_run_at:
+        schedule["nextRunAt"] = calculate_next_schedule_run(
+            cadence=str(schedule.get("cadence") or "daily"),
+            time_local=str(schedule.get("timeLocal") or "06:00"),
+            timezone_name=str(schedule.get("timezone") or "UTC"),
+            day_of_week=schedule.get("dayOfWeek"),
+        )
+        schedule["updatedAt"] = utc_now_iso()
+        STATE_STORE.worker_schedules.save(scope_id, schedule)
+        return {"due": False, "reason": "next_run_initialized", "schedule": schedule}
+
+    now = datetime.now(timezone.utc)
+    if _parse_utc_iso(next_run_at) > now:
+        return {"due": False, "reason": "not_due", "schedule": schedule}
+
+    claimed_at = utc_now_iso()
+    schedule["lastTriggeredAt"] = claimed_at
+    schedule["nextRunAt"] = calculate_next_schedule_run(
+        cadence=str(schedule.get("cadence") or "daily"),
+        time_local=str(schedule.get("timeLocal") or "06:00"),
+        timezone_name=str(schedule.get("timezone") or "UTC"),
+        day_of_week=schedule.get("dayOfWeek"),
+        after_utc=now + timedelta(seconds=1),
+    )
+    schedule["updatedAt"] = claimed_at
+    STATE_STORE.worker_schedules.save(scope_id, schedule)
+    return {
+        "due": True,
+        "triggerType": "schedule",
+        "claimedAt": claimed_at,
+        "schedule": schedule,
+    }
+
+
+# =========================================================
 # AG-UI HELPERS
 # =========================================================
 
+
+
+
+def get_requested_worker_trigger(payload: dict[str, Any]) -> str:
+    state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+    request_meta = (
+        state.get("flowoneWorkerRequest")
+        if isinstance(state.get("flowoneWorkerRequest"), dict)
+        else {}
+    )
+    trigger = str(request_meta.get("triggerType") or "on_demand").strip().lower()
+    return trigger if trigger in {"on_demand", "schedule"} else "on_demand"
 
 def encode_sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event)}\n\n"
@@ -1058,6 +1304,25 @@ async def run_agent(request: Request) -> StreamingResponse:
                     )
                     return
 
+                persistence_scope_id = execution_context.persistence_scope_id()
+                worker_control = get_worker_control(persistence_scope_id, worker_id)
+                if worker_control.get("status") == "paused":
+                    async for event in stream_static_message(
+                        message_id,
+                        f"{access.worker.label} is paused. Resume the worker in Agent Center before running it.",
+                    ):
+                        yield event
+                    yield encode_sse(
+                        {
+                            "type": "RUN_FINISHED",
+                            "threadId": thread_id,
+                            "runId": run_id,
+                        }
+                    )
+                    return
+
+                requested_trigger_type = get_requested_worker_trigger(payload)
+
                 if worker_id != "daily_ar_priorities":
                     async for event in stream_static_message(
                         message_id,
@@ -1075,7 +1340,6 @@ async def run_agent(request: Request) -> StreamingResponse:
 
                 worker_run_id = str(uuid.uuid4())
                 worker_started_at = utc_now_iso()
-                persistence_scope_id = execution_context.persistence_scope_id()
                 STATE_STORE.worker_runs.save(
                     persistence_scope_id,
                     {
@@ -1085,7 +1349,7 @@ async def run_agent(request: Request) -> StreamingResponse:
                         "workerId": access.worker.id,
                         "workerLabel": access.worker.label,
                         "status": "running",
-                        "triggerType": access.worker.trigger,
+                        "triggerType": requested_trigger_type,
                         "startedAt": worker_started_at,
                         "completedAt": "",
                         "caseCount": 0,
@@ -1115,6 +1379,7 @@ async def run_agent(request: Request) -> StreamingResponse:
                             "label": access.worker.label,
                             "runId": worker_run_id,
                             "executionMode": access.worker.execution_mode,
+                            "triggerType": requested_trigger_type,
                             "outputResource": access.worker.output_resource,
                             "permittedTools": list(access.permitted_tools),
                             "deniedTools": list(access.denied_tools),
@@ -1126,6 +1391,7 @@ async def run_agent(request: Request) -> StreamingResponse:
                 try:
                     async for worker_event in worker.stream_run(
                         run_id=worker_run_id,
+                        trigger_type=requested_trigger_type,
                     ):
                         if worker_event.get("kind") == "step":
                             yield encode_sse(
@@ -1172,7 +1438,7 @@ async def run_agent(request: Request) -> StreamingResponse:
                             "workerId": access.worker.id,
                             "workerLabel": access.worker.label,
                             "status": "failed",
-                            "triggerType": access.worker.trigger,
+                            "triggerType": requested_trigger_type,
                             "startedAt": worker_started_at,
                             "completedAt": utc_now_iso(),
                             "caseCount": 0,

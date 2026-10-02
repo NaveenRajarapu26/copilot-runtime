@@ -2,7 +2,9 @@ from .repositories import (
     ApprovalRepository,
     CaseRepository,
     JourneyRepository,
+    WorkerControlRepository,
     WorkerRunRepository,
+    WorkerScheduleRepository,
 )
 from .sqlite_store import SQLiteStateStore
 
@@ -11,5 +13,7 @@ __all__ = [
     "CaseRepository",
     "JourneyRepository",
     "SQLiteStateStore",
+    "WorkerControlRepository",
     "WorkerRunRepository",
+    "WorkerScheduleRepository",
 ]

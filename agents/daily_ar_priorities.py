@@ -516,6 +516,7 @@ class DailyArPrioritiesWorker:
         *,
         run_id: str,
         started_at: str | None = None,
+        trigger_type: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         started = started_at or utc_now_iso()
         permitted = set(self.access.permitted_tools)
@@ -708,7 +709,7 @@ class DailyArPrioritiesWorker:
             worker_id=self.access.worker.id,
             worker_label=self.access.worker.label,
             status="completed",
-            trigger_type=self.access.worker.trigger,
+            trigger_type=trigger_type or self.access.worker.trigger,
             started_at=started,
             completed_at=completed,
             case_ids=[str(case.get("caseId") or "") for case in cases],

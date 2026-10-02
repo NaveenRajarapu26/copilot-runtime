@@ -11,7 +11,9 @@ from .repositories import (
     ApprovalRepository,
     CaseRepository,
     JourneyRepository,
+    WorkerControlRepository,
     WorkerRunRepository,
+    WorkerScheduleRepository,
 )
 
 
@@ -424,6 +426,113 @@ class SQLiteApprovalRepository(_SQLiteBase, ApprovalRepository):
         return [_json_load(row["payload_json"]) for row in rows]
 
 
+class SQLiteWorkerControlRepository(_SQLiteBase, WorkerControlRepository):
+    def save(self, scope_id: str, control: Mapping[str, Any]) -> None:
+        worker_id = str(control.get("workerId") or "").strip()
+        if not worker_id:
+            raise ValueError("Worker control requires workerId.")
+        status = str(control.get("status") or "active").strip().lower()
+        if status not in {"active", "paused"}:
+            raise ValueError("Worker control status must be active or paused.")
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_controls(
+                    scope_id, worker_id, status, updated_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(scope_id, worker_id) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    payload_json=excluded.payload_json
+                """,
+                (
+                    scope_id,
+                    worker_id,
+                    status,
+                    str(control.get("updatedAt") or ""),
+                    _json_dump(control),
+                ),
+            )
+
+    def get(self, scope_id: str, worker_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM worker_controls WHERE scope_id=? AND worker_id=?",
+                (scope_id, worker_id),
+            ).fetchone()
+        return _json_load(row["payload_json"]) if row else None
+
+    def list(self, scope_id: str) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload_json FROM worker_controls
+                WHERE scope_id=? ORDER BY worker_id ASC
+                """,
+                (scope_id,),
+            ).fetchall()
+        return [_json_load(row["payload_json"]) for row in rows]
+
+
+class SQLiteWorkerScheduleRepository(_SQLiteBase, WorkerScheduleRepository):
+    def save(self, scope_id: str, schedule: Mapping[str, Any]) -> None:
+        worker_id = str(schedule.get("workerId") or "").strip()
+        schedule_id = str(schedule.get("scheduleId") or f"{worker_id}:default").strip()
+        if not worker_id:
+            raise ValueError("Worker schedule requires workerId.")
+        payload = dict(schedule)
+        payload["scheduleId"] = schedule_id
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_schedules(
+                    scope_id, schedule_id, worker_id, enabled, cadence,
+                    time_local, timezone_name, next_run_at, updated_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope_id, worker_id) DO UPDATE SET
+                    schedule_id=excluded.schedule_id,
+                    enabled=excluded.enabled,
+                    cadence=excluded.cadence,
+                    time_local=excluded.time_local,
+                    timezone_name=excluded.timezone_name,
+                    next_run_at=excluded.next_run_at,
+                    updated_at=excluded.updated_at,
+                    payload_json=excluded.payload_json
+                """,
+                (
+                    scope_id,
+                    schedule_id,
+                    worker_id,
+                    1 if bool(schedule.get("enabled")) else 0,
+                    str(schedule.get("cadence") or "daily"),
+                    str(schedule.get("timeLocal") or ""),
+                    str(schedule.get("timezone") or "UTC"),
+                    str(schedule.get("nextRunAt") or ""),
+                    str(schedule.get("updatedAt") or ""),
+                    _json_dump(payload),
+                ),
+            )
+
+    def get(self, scope_id: str, worker_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM worker_schedules WHERE scope_id=? AND worker_id=?",
+                (scope_id, worker_id),
+            ).fetchone()
+        return _json_load(row["payload_json"]) if row else None
+
+    def list(self, scope_id: str) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload_json FROM worker_schedules
+                WHERE scope_id=? ORDER BY worker_id ASC
+                """,
+                (scope_id,),
+            ).fetchall()
+        return [_json_load(row["payload_json"]) for row in rows]
+
+
 class SQLiteStateStore(_SQLiteBase):
     """Local durable implementation behind repository interfaces.
 
@@ -439,6 +548,8 @@ class SQLiteStateStore(_SQLiteBase):
         self.cases = SQLiteCaseRepository(self.db_path)
         self.journeys = SQLiteJourneyRepository(self.db_path)
         self.approvals = SQLiteApprovalRepository(self.db_path)
+        self.worker_controls = SQLiteWorkerControlRepository(self.db_path)
+        self.worker_schedules = SQLiteWorkerScheduleRepository(self.db_path)
 
     def _initialize_schema(self) -> None:
         with self.connection() as conn:
@@ -518,6 +629,35 @@ class SQLiteStateStore(_SQLiteBase):
                     ON approvals(scope_id, status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_approvals_scope_journey
                     ON approvals(scope_id, journey_id);
+
+
+                CREATE TABLE IF NOT EXISTS worker_controls(
+                    scope_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at TEXT,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY(scope_id, worker_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_worker_controls_scope_status
+                    ON worker_controls(scope_id, status);
+
+                CREATE TABLE IF NOT EXISTS worker_schedules(
+                    scope_id TEXT NOT NULL,
+                    schedule_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    cadence TEXT,
+                    time_local TEXT,
+                    timezone_name TEXT,
+                    next_run_at TEXT,
+                    updated_at TEXT,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY(scope_id, schedule_id),
+                    UNIQUE(scope_id, worker_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_worker_schedules_scope_due
+                    ON worker_schedules(scope_id, enabled, next_run_at);
                 """
             )
 
