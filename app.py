@@ -10,6 +10,15 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from agents import DailyArPrioritiesWorker, DailyArWorkerError, resolve_worker_access
+from flowone import (
+    DailyArToolService,
+    FlowOneApiError,
+    FlowOneClient,
+    FlowOneContextError,
+    FlowOneRequestContext,
+)
+
 
 # =========================================================
 # ENVIRONMENT
@@ -31,7 +40,7 @@ OPENROUTER_URL = os.getenv(
 
 app = FastAPI(
     title="FlowOne Copilot Runtime",
-    version="0.6.0",
+    version="0.8.0",
 )
 
 app.add_middleware(
@@ -54,7 +63,8 @@ async def health() -> dict[str, Any]:
         "mode": "local-poc",
         "model": OPENROUTER_MODEL,
         "openrouterConfigured": bool(OPENROUTER_API_KEY),
-        "runtimeVersion": "0.6.0",
+        "runtimeVersion": "0.8.0",
+        "flowOneApiClient": "request-scoped",
     }
 
 
@@ -102,6 +112,32 @@ def build_flowone_context(state: dict[str, Any]) -> str:
         return "No FlowOne application context was supplied."
 
     return json.dumps(state, indent=2, default=str)
+
+
+def get_flowone_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
+    state = payload.get("state") or {}
+    if not isinstance(state, dict):
+        return {}
+
+    permissions = state.get("permissions") or {}
+    if not isinstance(permissions, dict):
+        return {}
+
+    capabilities = permissions.get("capabilities") or {}
+    return capabilities if isinstance(capabilities, dict) else {}
+
+
+def get_flowone_currency_code(payload: dict[str, Any]) -> str:
+    state = payload.get("state") or {}
+    if not isinstance(state, dict):
+        return "USD"
+
+    ar_context = state.get("accountsReceivable") or {}
+    if not isinstance(ar_context, dict):
+        return "USD"
+
+    value = str(ar_context.get("currencyCode") or "USD").strip()
+    return value or "USD"
 
 
 # =========================================================
@@ -190,6 +226,28 @@ def route_known_request(user_message: str) -> dict[str, Any] | None:
 
     if not text:
         return None
+
+    if text in {
+        "validate daily ar backend",
+        "validate daily ar tools",
+        "check daily ar backend",
+        "check daily ar tools",
+    }:
+        return {
+            "intent": "VALIDATE_WORKER_TOOLS",
+            "workerId": "daily_ar_priorities",
+        }
+
+    if text in {
+        "run daily ar priorities",
+        "run daily ar priority",
+        "start daily ar priorities",
+        "start daily ar priority",
+    } or ("daily ar" in text and any(word in text for word in ("run", "start"))):
+        return {
+            "intent": "RUN_WORKER",
+            "workerId": "daily_ar_priorities",
+        }
 
     if "collection overview" in text or "collections overview" in text:
         return {"intent": "SHOW", "resource": "collection_overview"}
@@ -290,6 +348,25 @@ ANSWER
 SHOW
 NAVIGATE
 ACT
+RUN_WORKER
+VALIDATE_WORKER_TOOLS
+
+RUN_WORKER:
+Use when the user explicitly asks to run/start Daily AR Priorities.
+
+{
+  "intent": "RUN_WORKER",
+  "workerId": "daily_ar_priorities"
+}
+
+VALIDATE_WORKER_TOOLS:
+Use only when the user explicitly asks to validate/check the Daily AR backend/tools.
+This is a local migration diagnostic and returns counts only.
+
+{
+  "intent": "VALIDATE_WORKER_TOOLS",
+  "workerId": "daily_ar_priorities"
+}
 
 SHOW resources:
 
@@ -642,6 +719,287 @@ async def run_agent(request: Request) -> StreamingResponse:
                     "stepName": "Classifying request",
                 }
             )
+
+            # -------------------------------------------------
+            # VALIDATE BACKEND WORKER TOOLS (LOCAL MIGRATION CHECK)
+            # -------------------------------------------------
+            if intent_result.get("intent") == "VALIDATE_WORKER_TOOLS":
+                worker_id = str(intent_result.get("workerId", "")).strip()
+                access = resolve_worker_access(
+                    worker_id,
+                    get_flowone_capabilities(payload),
+                )
+
+                if access is None:
+                    async for event in stream_static_message(
+                        message_id,
+                        "That FlowOne worker is not registered in this runtime.",
+                    ):
+                        yield event
+                    yield encode_sse(
+                        {
+                            "type": "RUN_FINISHED",
+                            "threadId": thread_id,
+                            "runId": run_id,
+                        }
+                    )
+                    return
+
+                if not access.allowed:
+                    async for event in stream_static_message(
+                        message_id,
+                        access.reason or "This worker is not available to your current FlowOne permissions.",
+                    ):
+                        yield event
+                    yield encode_sse(
+                        {
+                            "type": "RUN_FINISHED",
+                            "threadId": thread_id,
+                            "runId": run_id,
+                        }
+                    )
+                    return
+
+                try:
+                    execution_context = FlowOneRequestContext.from_request(request)
+                except FlowOneContextError as error:
+                    async for event in stream_static_message(
+                        message_id,
+                        f"Daily AR backend validation could not start: {error}",
+                    ):
+                        yield event
+                    yield encode_sse(
+                        {
+                            "type": "RUN_FINISHED",
+                            "threadId": thread_id,
+                            "runId": run_id,
+                        }
+                    )
+                    return
+
+                service = DailyArToolService(FlowOneClient(execution_context))
+                counts: dict[str, int] = {}
+                failures: list[str] = []
+
+                for tool_id in access.permitted_tools:
+                    yield encode_sse(
+                        {
+                            "type": "STEP_STARTED",
+                            "stepName": f"Validating {tool_id}",
+                        }
+                    )
+                    try:
+                        result = await service.run_tool(tool_id)
+                        counts[tool_id] = result.count
+                    except (FlowOneApiError, KeyError) as error:
+                        failures.append(f"{tool_id}: {error}")
+                    yield encode_sse(
+                        {
+                            "type": "STEP_FINISHED",
+                            "stepName": f"Validating {tool_id}",
+                        }
+                    )
+
+                lines = [
+                    "Daily AR backend FlowOne tool validation finished.",
+                    *[f"{tool_id}: {count} records" for tool_id, count in counts.items()],
+                ]
+                if access.denied_tools:
+                    lines.append(
+                        "Permission-skipped tools: " + ", ".join(access.denied_tools)
+                    )
+                if failures:
+                    lines.append("Failures: " + " | ".join(failures))
+                else:
+                    lines.append("All permitted backend tools completed successfully.")
+
+                async for event in stream_static_message(
+                    message_id,
+                    "\n".join(lines),
+                ):
+                    yield event
+
+                yield encode_sse(
+                    {
+                        "type": "RUN_FINISHED",
+                        "threadId": thread_id,
+                        "runId": run_id,
+                    }
+                )
+                return
+
+            # -------------------------------------------------
+            # RUN WORKER
+            # -------------------------------------------------
+            if intent_result.get("intent") == "RUN_WORKER":
+                worker_id = str(intent_result.get("workerId", "")).strip()
+                capabilities = get_flowone_capabilities(payload)
+                access = resolve_worker_access(worker_id, capabilities)
+
+                if access is None:
+                    async for event in stream_static_message(
+                        message_id,
+                        "That FlowOne worker is not registered in this runtime.",
+                    ):
+                        yield event
+
+                    yield encode_sse(
+                        {
+                            "type": "RUN_FINISHED",
+                            "threadId": thread_id,
+                            "runId": run_id,
+                        }
+                    )
+                    return
+
+                if not access.allowed:
+                    async for event in stream_static_message(
+                        message_id,
+                        access.reason
+                        or "This worker is not available to your current FlowOne permissions.",
+                    ):
+                        yield event
+
+                    yield encode_sse(
+                        {
+                            "type": "RUN_FINISHED",
+                            "threadId": thread_id,
+                            "runId": run_id,
+                        }
+                    )
+                    return
+
+                try:
+                    execution_context = FlowOneRequestContext.from_request(request)
+                except FlowOneContextError as error:
+                    async for event in stream_static_message(
+                        message_id,
+                        f"Daily AR could not start through the backend worker path: {error}",
+                    ):
+                        yield event
+                    yield encode_sse(
+                        {
+                            "type": "RUN_FINISHED",
+                            "threadId": thread_id,
+                            "runId": run_id,
+                        }
+                    )
+                    return
+
+                if worker_id != "daily_ar_priorities":
+                    async for event in stream_static_message(
+                        message_id,
+                        "That worker is registered but does not yet have a backend executor.",
+                    ):
+                        yield event
+                    yield encode_sse(
+                        {
+                            "type": "RUN_FINISHED",
+                            "threadId": thread_id,
+                            "runId": run_id,
+                        }
+                    )
+                    return
+
+                worker_run_id = str(uuid.uuid4())
+                service = DailyArToolService(FlowOneClient(execution_context))
+                worker = DailyArPrioritiesWorker(
+                    tools=service,
+                    access=access,
+                    capabilities=capabilities,
+                    currency_code=get_flowone_currency_code(payload),
+                )
+
+                yield encode_sse(
+                    {
+                        "type": "CUSTOM",
+                        "name": "FLOWONE_WORKER_STARTED",
+                        "value": {
+                            "workerId": access.worker.id,
+                            "label": access.worker.label,
+                            "runId": worker_run_id,
+                            "executionMode": access.worker.execution_mode,
+                            "outputResource": access.worker.output_resource,
+                            "permittedTools": list(access.permitted_tools),
+                            "deniedTools": list(access.denied_tools),
+                            "steps": worker.steps,
+                        },
+                    }
+                )
+
+                try:
+                    async for worker_event in worker.stream_run(
+                        run_id=worker_run_id,
+                    ):
+                        if worker_event.get("kind") == "step":
+                            yield encode_sse(
+                                {
+                                    "type": "CUSTOM",
+                                    "name": "FLOWONE_WORKER_STEP",
+                                    "value": {
+                                        "workerId": access.worker.id,
+                                        "runId": worker_run_id,
+                                        **{
+                                            key: value
+                                            for key, value in worker_event.items()
+                                            if key != "kind"
+                                        },
+                                    },
+                                }
+                            )
+                        elif worker_event.get("kind") == "result":
+                            yield encode_sse(
+                                {
+                                    "type": "CUSTOM",
+                                    "name": "FLOWONE_WORKER_RESULT",
+                                    "value": {
+                                        "workerId": access.worker.id,
+                                        "runId": worker_run_id,
+                                        "outputResource": access.worker.output_resource,
+                                        "run": worker_event.get("run"),
+                                    },
+                                }
+                            )
+                except DailyArWorkerError as error:
+                    yield encode_sse(
+                        {
+                            "type": "CUSTOM",
+                            "name": "FLOWONE_WORKER_FAILED",
+                            "value": {
+                                "workerId": access.worker.id,
+                                "runId": worker_run_id,
+                                "message": str(error),
+                            },
+                        }
+                    )
+                    async for event in stream_static_message(
+                        message_id,
+                        str(error),
+                    ):
+                        yield event
+                    yield encode_sse(
+                        {
+                            "type": "RUN_FINISHED",
+                            "threadId": thread_id,
+                            "runId": run_id,
+                        }
+                    )
+                    return
+
+                async for event in stream_static_message(
+                    message_id,
+                    "Daily AR Priorities completed in the FlowOne backend and the priority cases are ready.",
+                ):
+                    yield event
+
+                yield encode_sse(
+                    {
+                        "type": "RUN_FINISHED",
+                        "threadId": thread_id,
+                        "runId": run_id,
+                    }
+                )
+                return
 
             # -------------------------------------------------
             # NAVIGATE
