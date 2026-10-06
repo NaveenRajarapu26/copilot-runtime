@@ -1,7 +1,12 @@
 from .daily_ar_priorities import (
     DailyArPrioritiesWorker,
     DailyArWorkerError,
-    STEP_DEFINITIONS,
+    STEP_DEFINITIONS as DAILY_AR_STEP_DEFINITIONS,
+)
+from .payment_followup_watch import (
+    PaymentFollowupWatchWorker,
+    PaymentFollowupWorkerError,
+    STEP_DEFINITIONS as PAYMENT_FOLLOWUP_STEP_DEFINITIONS,
 )
 from .registry import (
     FLOWONE_WORKER_REGISTRY,
@@ -13,8 +18,11 @@ from .registry import (
 __all__ = [
     "DailyArPrioritiesWorker",
     "DailyArWorkerError",
+    "PaymentFollowupWatchWorker",
+    "PaymentFollowupWorkerError",
     "FLOWONE_WORKER_REGISTRY",
-    "STEP_DEFINITIONS",
+    "DAILY_AR_STEP_DEFINITIONS",
+    "PAYMENT_FOLLOWUP_STEP_DEFINITIONS",
     "WorkerAccess",
     "get_worker",
     "resolve_worker_access",

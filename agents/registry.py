@@ -18,6 +18,7 @@ class WorkerDefinition:
     output_resource: str
     human_approval_mode: str
     execution_mode: str
+    required_tool_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,11 +61,39 @@ FLOWONE_WORKER_REGISTRY: dict[str, WorkerDefinition] = {
             "get_credit_notes",
             "get_assigned_tasks",
         ),
+        required_tool_ids=("get_overdue_customers",),
         trigger="on_demand",
         output_resource="daily_ar_priorities_result",
         human_approval_mode="external_actions_only",
-        # Feature 3: sequencing, FlowOne tool execution and result construction
-        # are owned by the FastAPI runtime. React renders worker events/results.
+        execution_mode="backend",
+    ),
+    "payment_followup_watch": WorkerDefinition(
+        id="payment_followup_watch",
+        label="Payment Follow-up Watch",
+        description=(
+            "Watches currently overdue accounts for missing payment-status evidence, "
+            "filters observed payment/credit-note blockers, and prepares follow-up cases."
+        ),
+        required_any_capabilities=(
+            "canViewCollections",
+            "canViewCustomers",
+        ),
+        tool_ids=(
+            "get_overdue_customers",
+            "get_customer_payments",
+            "get_credit_notes",
+            "get_assigned_tasks",
+        ),
+        # Overdue exposure + payment visibility are required to make the watch
+        # meaningful. Credit-note/task context may be unavailable; in that case
+        # the worker continues conservatively and does not assume outreach is safe.
+        required_tool_ids=(
+            "get_overdue_customers",
+            "get_customer_payments",
+        ),
+        trigger="condition_watch",
+        output_resource="payment_followup_watch_result",
+        human_approval_mode="external_actions_only",
         execution_mode="backend",
     ),
 }
@@ -116,19 +145,28 @@ def resolve_worker_access(
         else:
             denied_tools.append(tool_id)
 
-    # Overdue/customer exposure is the minimum source required to produce
-    # Daily AR cases. Optional evidence sources may be denied without blocking
-    # the worker, matching the current stable POC behavior.
-    if "get_overdue_customers" not in permitted_tools:
+    missing_required = [
+        tool_id
+        for tool_id in worker.required_tool_ids
+        if tool_id not in permitted_tools
+    ]
+    if missing_required:
+        if worker.id == "payment_followup_watch" and "get_customer_payments" in missing_required:
+            reason = (
+                "Payment Follow-up Watch requires permission to view customer payments "
+                "in addition to overdue customer exposure."
+            )
+        else:
+            reason = (
+                f"{worker.label} cannot run because required FlowOne evidence is "
+                "not available to the current permission set."
+            )
         return WorkerAccess(
             allowed=False,
             worker=worker,
             permitted_tools=tuple(permitted_tools),
             denied_tools=tuple(denied_tools),
-            reason=(
-                "Daily AR Priorities cannot run because overdue customer "
-                "exposure is not available to the current user."
-            ),
+            reason=reason,
         )
 
     return WorkerAccess(

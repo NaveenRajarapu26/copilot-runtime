@@ -12,7 +12,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from agents import DailyArPrioritiesWorker, DailyArWorkerError, get_worker, resolve_worker_access
+from agents import (
+    DailyArPrioritiesWorker,
+    DailyArWorkerError,
+    PaymentFollowupWatchWorker,
+    PaymentFollowupWorkerError,
+    get_worker,
+    resolve_worker_access,
+)
 from persistence import SQLiteStateStore
 from models import WorkerControl, WorkerSchedule
 
@@ -51,7 +58,7 @@ STATE_STORE = SQLiteStateStore(STATE_DB_PATH)
 
 app = FastAPI(
     title="FlowOne Copilot Runtime",
-    version="0.11.0",
+    version="0.12.0",
 )
 
 app.add_middleware(
@@ -74,7 +81,7 @@ async def health() -> dict[str, Any]:
         "mode": "local-poc",
         "model": OPENROUTER_MODEL,
         "openrouterConfigured": bool(OPENROUTER_API_KEY),
-        "runtimeVersion": "0.11.0",
+        "runtimeVersion": "0.12.0",
         "flowOneApiClient": "request-scoped",
         "statePersistence": "sqlite-local",
         "schedulerMode": "authenticated-session",
@@ -667,6 +674,23 @@ def route_known_request(user_message: str) -> dict[str, Any] | None:
             "workerId": "daily_ar_priorities",
         }
 
+    if text in {
+        "run payment follow-up watch",
+        "run payment followup watch",
+        "start payment follow-up watch",
+        "start payment followup watch",
+        "check payment follow-up watch",
+    } or (
+        "payment" in text
+        and "follow" in text
+        and "watch" in text
+        and any(word in text for word in ("run", "start", "check"))
+    ):
+        return {
+            "intent": "RUN_WORKER",
+            "workerId": "payment_followup_watch",
+        }
+
     if "collection overview" in text or "collections overview" in text:
         return {"intent": "SHOW", "resource": "collection_overview"}
 
@@ -770,11 +794,18 @@ RUN_WORKER
 VALIDATE_WORKER_TOOLS
 
 RUN_WORKER:
-Use when the user explicitly asks to run/start Daily AR Priorities.
+Use when the user explicitly asks to run/start a registered FlowOne worker.
 
+Daily AR Priorities:
 {
   "intent": "RUN_WORKER",
   "workerId": "daily_ar_priorities"
+}
+
+Payment Follow-up Watch:
+{
+  "intent": "RUN_WORKER",
+  "workerId": "payment_followup_watch"
 }
 
 VALIDATE_WORKER_TOOLS:
@@ -922,6 +953,11 @@ If no supported intent applies:
                 "action": "collection_followup",
                 "customerName": str(result.get("customerName", "")).strip(),
             }
+
+    if intent == "RUN_WORKER":
+        worker_id = str(result.get("workerId", "")).strip()
+        if worker_id in {"daily_ar_priorities", "payment_followup_watch"}:
+            return {"intent": "RUN_WORKER", "workerId": worker_id}
 
     return {"intent": "ANSWER"}
 
@@ -1292,7 +1328,7 @@ async def run_agent(request: Request) -> StreamingResponse:
                 except FlowOneContextError as error:
                     async for event in stream_static_message(
                         message_id,
-                        f"Daily AR could not start through the backend worker path: {error}",
+                        f"{access.worker.label} could not start through the backend worker path: {error}",
                     ):
                         yield event
                     yield encode_sse(
@@ -1323,7 +1359,7 @@ async def run_agent(request: Request) -> StreamingResponse:
 
                 requested_trigger_type = get_requested_worker_trigger(payload)
 
-                if worker_id != "daily_ar_priorities":
+                if worker_id not in {"daily_ar_priorities", "payment_followup_watch"}:
                     async for event in stream_static_message(
                         message_id,
                         "That worker is registered but does not yet have a backend executor.",
@@ -1363,11 +1399,20 @@ async def run_agent(request: Request) -> StreamingResponse:
                     },
                 )
                 service = DailyArToolService(FlowOneClient(execution_context))
-                worker = DailyArPrioritiesWorker(
-                    tools=service,
-                    access=access,
-                    capabilities=capabilities,
-                    currency_code=get_flowone_currency_code(payload),
+                worker = (
+                    DailyArPrioritiesWorker(
+                        tools=service,
+                        access=access,
+                        capabilities=capabilities,
+                        currency_code=get_flowone_currency_code(payload),
+                    )
+                    if worker_id == "daily_ar_priorities"
+                    else PaymentFollowupWatchWorker(
+                        tools=service,
+                        access=access,
+                        capabilities=capabilities,
+                        currency_code=get_flowone_currency_code(payload),
+                    )
                 )
 
                 yield encode_sse(
@@ -1428,7 +1473,7 @@ async def run_agent(request: Request) -> StreamingResponse:
                                     },
                                 }
                             )
-                except DailyArWorkerError as error:
+                except (DailyArWorkerError, PaymentFollowupWorkerError) as error:
                     STATE_STORE.worker_runs.save(
                         persistence_scope_id,
                         {
@@ -1473,9 +1518,14 @@ async def run_agent(request: Request) -> StreamingResponse:
                     )
                     return
 
+                completion_message = (
+                    "Daily AR Priorities completed in the FlowOne backend and the priority cases are ready."
+                    if worker_id == "daily_ar_priorities"
+                    else "Payment Follow-up Watch completed in the FlowOne backend and the follow-up cases are ready."
+                )
                 async for event in stream_static_message(
                     message_id,
-                    "Daily AR Priorities completed in the FlowOne backend and the priority cases are ready.",
+                    completion_message,
                 ):
                     yield event
 
